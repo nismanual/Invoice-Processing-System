@@ -1,0 +1,403 @@
+package com.invoice.processing;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+import com.amazonaws.services.lambda.runtime.Context;
+import com.amazonaws.services.lambda.runtime.RequestHandler;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
+import software.amazon.awssdk.services.dynamodb.model.GetItemRequest;
+import software.amazon.awssdk.services.dynamodb.model.GetItemResponse;
+import software.amazon.awssdk.services.dynamodb.model.QueryRequest;
+import software.amazon.awssdk.services.dynamodb.model.QueryResponse;
+import software.amazon.awssdk.services.dynamodb.model.ScanRequest;
+import software.amazon.awssdk.services.dynamodb.model.ScanResponse;
+
+/**
+ * GetInvoiceHandler – called by API Gateway.
+ *
+ * Routes:
+ *   GET /invoices          → list all invoices  (queryStringParameters absent)
+ *   GET /invoices?id=XXX   → get single invoice by invoiceId
+ *
+ * API Gateway proxy integration passes the event as:
+ * {
+ *   "queryStringParameters": { "id": "# 11502" },   // optional
+ *   "httpMethod": "GET"
+ * }
+ *
+ * Response is always API Gateway proxy format:
+ * {
+ *   "statusCode": 200,
+ *   "headers": { "Content-Type": "application/json",
+ *                "Access-Control-Allow-Origin": "*" },
+ *   "body": "<json string>"
+ * }
+ */
+public class GetInvoiceHandler
+        implements RequestHandler<Map<String, Object>, Map<String, Object>> {
+
+    private static final String DYNAMO_TABLE = System.getenv("DYNAMO_TABLE") != null
+            ? System.getenv("DYNAMO_TABLE") : "invoices";
+
+    // Built eagerly at handler init so the SDK stack is captured in the SnapStart
+    // snapshot; the restored environment reuses this fully-formed client.
+    private static final DynamoDbClient dynamoDbClient = DynamoDbClient.builder()
+            .region(Region.AP_SOUTH_1).build();
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Override
+    public Map<String, Object> handleRequest(Map<String, Object> event, Context context) {
+        try {
+            context.getLogger().log("GetInvoice EVENT: " + objectMapper.writeValueAsString(event));
+
+            // ── Warm-up ping ──────────────────────────────────────────────────
+            // Prime the DynamoDB connection when invoked by the scheduled
+            // lambda-warm ({"warmup":true}) instead of a real API request.
+            if (Boolean.TRUE.equals(event.get("warmup"))) {
+                dynamoDbClient.describeTable(b -> b.tableName(DYNAMO_TABLE));
+                context.getLogger().log("WARMUP: DynamoDB connection primed");
+                Map<String, Object> warm = new HashMap<>();
+                warm.put("statusCode", 200);
+                warm.put("body", "{\"warmup\":true}");
+                return warm;
+            }
+
+            // Extract ?id=... and ?search=... query parameters if present
+            String invoiceId = null;
+            String search    = null;
+            Object qsp = event.get("queryStringParameters");
+            if (qsp instanceof Map) {
+                invoiceId = (String) ((Map<?, ?>) qsp).get("id");
+                search    = (String) ((Map<?, ?>) qsp).get("search");
+            }
+            invoiceId = normalizeId(invoiceId);
+
+            if (!invoiceId.isBlank()) {
+                // ── Single invoice lookup ──────────────────────────────────
+                return getById(invoiceId, context);
+            }
+
+            int pageSize = 20;
+            String nextToken = null;
+            if (qsp instanceof Map) {
+                String pageSizeStr  = (String) ((Map<?, ?>) qsp).get("pageSize");
+                String nextTokenStr = (String) ((Map<?, ?>) qsp).get("nextToken");
+                if (pageSizeStr != null && !pageSizeStr.isBlank()) {
+                    try { pageSize = Math.min(100, Math.max(1, Integer.parseInt(pageSizeStr))); }
+                    catch (NumberFormatException ignored) {}
+                }
+                if (nextTokenStr != null && !nextTokenStr.isBlank()) {
+                    nextToken = nextTokenStr;
+                }
+            }
+
+            if (search != null && !search.isBlank()) {
+                // ── Search across ALL invoices (case-insensitive) ─────────
+                return searchPaged(normalizeId(search), pageSize, context);
+            }
+
+            // ── Paginated list ─────────────────────────────────────────────
+            return listPaged(pageSize, nextToken, context);
+
+        } catch (Exception e) {
+            context.getLogger().log("GetInvoice ERROR: " + e.getMessage());
+            return errorResponse(500, "Internal server error: " + e.getMessage());
+        }
+    }
+
+    // ── Single item ────────────────────────────────────────────────────────────
+
+    private Map<String, Object> getById(String invoiceId, Context ctx) throws Exception {
+        Map<String, AttributeValue> key = new HashMap<>();
+        key.put("invoiceId", AttributeValue.builder().s(invoiceId).build());
+
+        GetItemResponse response = dynamoDbClient.getItem(
+                GetItemRequest.builder()
+                        .tableName(DYNAMO_TABLE)
+                        .key(key)
+                        .build());
+
+        if (!response.hasItem()) {
+            // Historic records store the id with its leading "#" (e.g. "#2642",
+            // "# 21500"). Resolve to the record whose normalized id matches.
+            String needle = normalizeId(invoiceId);
+            for (Map<String, Object> candidate : findMatches(needle)) {
+                String stored = String.valueOf(candidate.getOrDefault("invoiceId", ""));
+                if (normalizeId(stored).equalsIgnoreCase(needle)) {
+                    ctx.getLogger().log("GetInvoice: by-id '" + invoiceId
+                            + "' resolved to stored id '" + stored + "'");
+                    return successResponse(candidate);
+                }
+            }
+            return errorResponse(404, "Invoice not found: " + invoiceId);
+        }
+
+        Map<String, Object> invoice = itemToMap(response.item());
+        ctx.getLogger().log("GetInvoice: found " + invoiceId);
+        return successResponse(invoice);
+    }
+
+    // ── List invoices with cursor-based pagination ─────────────────────────────
+    // Supports:
+    //   GET /invoices                          → first page (default 20 items)
+    //   GET /invoices?pageSize=50              → first page, 50 items
+    //   GET /invoices?nextToken=<base64>       → next page using DynamoDB cursor
+    //
+    // Response:
+    // {
+    //   "items"    : [ ... ],
+    //   "nextToken": "<base64>" or null   (null = last page)
+    //   "pageSize" : 20,
+    //   "count"    : 18
+    // }
+
+    private Map<String, Object> listPaged(int pageSize, String nextToken, Context ctx) throws Exception {
+
+        // Build the exclusive start key if nextToken provided
+        final Map<String, AttributeValue> startKey = new HashMap<>();
+        if (nextToken != null && !nextToken.isBlank()) {
+            try {
+                String decoded = new String(java.util.Base64.getUrlDecoder().decode(nextToken));
+                Map<String, Object> keyMap = objectMapper.readValue(decoded, Map.class);
+                keyMap.forEach((k, v) -> startKey.put(k, AttributeValue.builder().s(v.toString()).build()));
+            } catch (Exception e) {
+                ctx.getLogger().log("WARNING: invalid nextToken, ignoring: " + e.getMessage());
+            }
+        }
+
+        // ── Run main scan + all 6 count queries in parallel ───────────────────
+        final int finalPageSize = pageSize;
+        CompletableFuture<ScanResponse> scanF = CompletableFuture.supplyAsync(() -> {
+            ScanRequest.Builder b = ScanRequest.builder()
+                    .tableName(DYNAMO_TABLE)
+                    .limit(finalPageSize);
+            if (!startKey.isEmpty()) b.exclusiveStartKey(startKey);
+            return dynamoDbClient.scan(b.build());
+        });
+
+        // Wait for the scan to complete, then merge in the stable counts
+        ScanResponse resp = scanF.join();
+        List<Map<String, Object>> items = new ArrayList<>();
+        resp.items().forEach(item -> items.add(itemToMap(item)));
+
+        // Encode the LastEvaluatedKey as a Base64 nextToken for the client
+        String newNextToken = null;
+        if (!resp.lastEvaluatedKey().isEmpty()) {
+            Map<String, String> keyMap = new HashMap<>();
+            resp.lastEvaluatedKey().forEach((k, v) -> keyMap.put(k, v.s()));
+            String json = objectMapper.writeValueAsString(keyMap);
+            newNextToken = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(json.getBytes());
+        }
+
+        Map<String, Object> result = loadCounts(ctx);
+        result.put("items",              items);
+        result.put("nextToken",          newNextToken);
+        result.put("pageSize",           pageSize);
+        result.put("count",              items.size());
+
+        ctx.getLogger().log("GetInvoice: returned " + items.size()
+                + " items, hasMore=" + (newNextToken != null));
+
+        return successResponse(result);
+    }
+
+    // ── Full-table case-insensitive search ─────────────────────────────────────
+    // The Audit page lets users search by invoice id or vendor. Because the
+    // table is small, and to keep matching case-insensitive (DynamoDB contains
+    // is case-sensitive), we scan the whole table in Java and return every
+    // match in one response (search results ignore pagination).
+    private Map<String, Object> searchPaged(String search, int pageSize, Context ctx) throws Exception {
+        List<Map<String, Object>> matches = findMatches(search);
+
+        Map<String, Object> result = loadCounts(ctx);
+        result.put("items",              matches);
+        result.put("nextToken",          null);
+        result.put("pageSize",           pageSize);
+        result.put("count",              matches.size());
+        result.put("search",             search);
+
+        ctx.getLogger().log("GetInvoice: search '" + search + "' matched " + matches.size() + " items");
+        return successResponse(result);
+    }
+
+    /** Case-insensitive contains match on invoiceId or vendorName across the whole table. */
+    private List<Map<String, Object>> findMatches(String search) {
+        String needle = search == null ? "" : search.toLowerCase();
+        if (needle.isBlank()) return new ArrayList<>();
+        List<Map<String, Object>> matches = new ArrayList<>();
+        Map<String, AttributeValue> lastKey = new HashMap<>();
+
+        do {
+            ScanRequest.Builder b = ScanRequest.builder()
+                    .tableName(DYNAMO_TABLE)
+                    .limit(100);
+            if (!lastKey.isEmpty()) b.exclusiveStartKey(lastKey);
+            ScanResponse r = dynamoDbClient.scan(b.build());
+            for (var item : r.items()) {
+                Map<String, Object> m = itemToMap(item);
+                String id   = String.valueOf(m.getOrDefault("invoiceId", ""));
+                String vend = String.valueOf(m.getOrDefault("vendorName", ""));
+                if (id.toLowerCase().contains(needle) || vend.toLowerCase().contains(needle)) {
+                    matches.add(m);
+                }
+            }
+            lastKey = r.lastEvaluatedKey();
+        } while (!lastKey.isEmpty());
+        return matches;
+    }
+
+    /** Trim whitespace and strip a leading '#' so "# 2642" matches stored "2642". */
+    private String normalizeId(String raw) {
+        if (raw == null) return "";
+        String s = raw.trim();
+        while (s.startsWith("#")) {
+            s = s.substring(1).trim();
+        }
+        return s;
+    }
+
+    /** Stable global counts, loaded in parallel (total + 6 status/decision counts). */
+    private Map<String, Object> loadCounts(Context ctx) throws Exception {
+        CompletableFuture<Integer> totalCountF         = CompletableFuture.supplyAsync(() -> getTotalCount(ctx));
+        CompletableFuture<Integer> totalApprovedF      = CompletableFuture.supplyAsync(() -> getCountByStatus("APPROVED", ctx));
+        CompletableFuture<Integer> totalReviewF        = CompletableFuture.supplyAsync(() -> getCountByStatus("REVIEW_REQUIRED", ctx));
+        CompletableFuture<Integer> totalDuplicateF     = CompletableFuture.supplyAsync(() -> getCountByStatus("DUPLICATE", ctx));
+        CompletableFuture<Integer> totalHumanApprovedF = CompletableFuture.supplyAsync(() -> getCountByDecision("APPROVED", ctx));
+        CompletableFuture<Integer> totalHumanRejectedF = CompletableFuture.supplyAsync(() -> getCountByDecision("REJECTED", ctx));
+
+        CompletableFuture.allOf(totalCountF, totalApprovedF, totalReviewF,
+                totalDuplicateF, totalHumanApprovedF, totalHumanRejectedF).join();
+
+        Map<String, Object> counts = new HashMap<>();
+        counts.put("totalCount",         totalCountF.join());
+        counts.put("totalApproved",      totalApprovedF.join());
+        counts.put("totalReview",        totalReviewF.join());
+        counts.put("totalDuplicate",     totalDuplicateF.join());
+        counts.put("totalHumanApproved", totalHumanApprovedF.join());
+        counts.put("totalHumanRejected", totalHumanRejectedF.join());
+        return counts;
+    }
+
+    // ── Get count of items by validationStatus using GSI (Query, not Scan) ──────
+    // GSI name: validationStatus-index  (partition key: validationStatus)
+    private int getCountByStatus(String status, Context ctx) {
+        try {
+            int count = 0;
+            Map<String, AttributeValue> lastKey = null;
+            do {
+                QueryRequest.Builder b = QueryRequest.builder()
+                        .tableName(DYNAMO_TABLE)
+                        .indexName("validationStatus-index")
+                        .keyConditionExpression("validationStatus = :s")
+                        .expressionAttributeValues(Map.of(
+                                ":s", AttributeValue.builder().s(status).build()))
+                        .select("COUNT");
+                if (lastKey != null) b.exclusiveStartKey(lastKey);
+                QueryResponse r = dynamoDbClient.query(b.build());
+                count  += r.count();
+                lastKey = r.lastEvaluatedKey().isEmpty() ? null : r.lastEvaluatedKey();
+            } while (lastKey != null);
+            return count;
+        } catch (Exception e) {
+            ctx.getLogger().log("WARNING: getCountByStatus(" + status + ") failed: " + e.getMessage());
+            return 0;
+        }
+    }
+
+    // ── Get count of items by reviewDecision using GSI (Query, not Scan) ────────
+    // GSI name: reviewDecision-index  (partition key: reviewDecision)
+    private int getCountByDecision(String decision, Context ctx) {
+        try {
+            int count = 0;
+            Map<String, AttributeValue> lastKey = null;
+            do {
+                QueryRequest.Builder b = QueryRequest.builder()
+                        .tableName(DYNAMO_TABLE)
+                        .indexName("reviewDecision-index")
+                        .keyConditionExpression("reviewDecision = :d")
+                        .expressionAttributeValues(Map.of(
+                                ":d", AttributeValue.builder().s(decision).build()))
+                        .select("COUNT");
+                if (lastKey != null) b.exclusiveStartKey(lastKey);
+                QueryResponse r = dynamoDbClient.query(b.build());
+                count  += r.count();
+                lastKey = r.lastEvaluatedKey().isEmpty() ? null : r.lastEvaluatedKey();
+            } while (lastKey != null);
+            return count;
+        } catch (Exception e) {
+            ctx.getLogger().log("WARNING: getCountByDecision(" + decision + ") failed: " + e.getMessage());
+            return 0;
+        }
+    }
+
+    // ── Get total item count via DynamoDB table scan count ────────────────────
+    private int getTotalCount(Context ctx) {
+        try {
+            int count = 0;
+            Map<String, AttributeValue> lastKey = null;
+            do {
+                ScanRequest.Builder b = ScanRequest.builder()
+                        .tableName(DYNAMO_TABLE)
+                        .select("COUNT");
+                if (lastKey != null) b.exclusiveStartKey(lastKey);
+                ScanResponse r = dynamoDbClient.scan(b.build());
+                count  += r.count();
+                lastKey = r.lastEvaluatedKey().isEmpty() ? null : r.lastEvaluatedKey();
+            } while (lastKey != null);
+            return count;
+        } catch (Exception e) {
+            ctx.getLogger().log("WARNING: could not get totalCount: " + e.getMessage());
+            return -1;
+        }
+    }
+
+    // ── DynamoDB item → plain Map ──────────────────────────────────────────────
+
+    private Map<String, Object> itemToMap(Map<String, AttributeValue> item) {
+        Map<String, Object> map = new HashMap<>();
+        item.forEach((key, attr) -> {
+            if (attr.s()  != null) map.put(key, attr.s());
+            else if (attr.n() != null) map.put(key, Double.parseDouble(attr.n()));
+            else if (attr.bool() != null) map.put(key, attr.bool());
+            else map.put(key, attr.toString());
+        });
+        return map;
+    }
+
+    // ── API Gateway response helpers ───────────────────────────────────────────
+
+    private Map<String, Object> successResponse(Object body) throws Exception {
+        return proxyResponse(200, objectMapper.writeValueAsString(body));
+    }
+
+    private Map<String, Object> errorResponse(int statusCode, String message) {
+        try {
+            return proxyResponse(statusCode,
+                    objectMapper.writeValueAsString(Map.of("error", message)));
+        } catch (Exception e) {
+            return proxyResponse(statusCode, "{\"error\":\"" + message + "\"}");
+        }
+    }
+
+    private Map<String, Object> proxyResponse(int statusCode, String jsonBody) {
+        Map<String, Object> response = new HashMap<>();
+        response.put("statusCode", statusCode);
+        response.put("headers", Map.of(
+                "Content-Type", "application/json",
+                "Access-Control-Allow-Origin", "*",        // required for Amplify / browser calls
+                "Access-Control-Allow-Methods", "GET,POST,OPTIONS",
+                "Access-Control-Allow-Headers", "Content-Type,Authorization"
+        ));
+        response.put("body", jsonBody);
+        return response;
+    }
+}

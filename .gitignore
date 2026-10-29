@@ -1,0 +1,38 @@
+# Maven build output
+target/
+node_modules/
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Presentation / Office transient files
+*.pptx
+~$*
+
+# Auto-generated Maven files
+dependency-reduced-pom.xml
+
+# Secrets — never commit these
+*.env
+secret-update.json
+
+# Transient logs / local outputs — never commit these
+jmeter.log
+out-*.json
+response.json
+test-payload.json
+
+# Deployment artifacts (regenerated per deploy)
+migration/packaged.json
+migration/params.json
+.aws-sam/
+packaged-template.yaml
+
+# Local junk folder — anything moved here is not part of the project
+junk/

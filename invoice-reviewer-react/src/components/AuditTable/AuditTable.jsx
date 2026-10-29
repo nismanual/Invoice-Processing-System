@@ -1,0 +1,74 @@
+import StatusBadge from "../StatusBadge";
+import ConfidenceBar from "../ConfidenceBar";
+import { humanReviewValue } from "../../utils/humanReview";
+import "./AuditTable.css";
+
+export default function AuditTable({
+  invoices = [],
+  hasNext = false,
+  hasPrev = false,
+  pageNumber = 1,
+  totalPages = null,
+  onNext = () => {},
+  onPrev = () => {},
+}) {
+
+  if (!invoices.length) {
+    return <div className="table-empty">No invoices found.</div>;
+  }
+
+  return (
+    <div>
+      <div className="table-wrapper">
+        <table className="audit-table">
+          <thead>
+            <tr>
+              <th>Invoice ID</th>
+              <th>Vendor</th>
+              <th>Total</th>
+              <th>AI Status</th>
+              <th>Human Review</th>
+              <th>Risk</th>
+              <th>Confidence</th>
+            </tr>
+          </thead>
+          <tbody>
+            {invoices.map((invoice) => (
+              <tr key={invoice.invoiceId}>
+                <td><code>{invoice.invoiceId}</code></td>
+                <td>{invoice.vendorName || "—"}</td>
+                <td>{invoice.total || "—"}</td>
+                <td><StatusBadge type="ai" value={invoice.validationStatus} /></td>
+                <td><StatusBadge type="human" value={humanReviewValue(invoice)} /></td>
+                <td><StatusBadge type="risk" value={invoice.risk} /></td>
+                <td><ConfidenceBar value={invoice.avgConfidence ?? invoice.totalConfidence} /></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="pagination-bar">
+        <button
+          className="btn btn-secondary btn-sm"
+          onClick={onPrev}
+          disabled={!hasPrev}
+        >
+          ← Previous
+        </button>
+
+        <span className="pagination-info">
+          Page {pageNumber}{totalPages ? ` of ${totalPages}` : ""}
+        </span>
+
+        <button
+          className="btn btn-secondary btn-sm"
+          onClick={onNext}
+          disabled={!hasNext}
+        >
+          Next →
+        </button>
+      </div>
+    </div>
+  );
+}
